@@ -74,12 +74,20 @@ function isAuthorized(req: IncomingMessage): boolean {
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
+  // Fast path: a small body on a keep-alive socket usually arrives with the headers, so
+  // drain whatever is already buffered; when the message is complete that is the whole body.
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let chunk: Buffer | null;
+  while ((chunk = req.read() as Buffer | null) !== null) {
+    chunks.push(chunk);
+    total += chunk.length;
+  }
+  if (req.complete) return Promise.resolve(Buffer.concat(chunks, total));
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    req.on('data', (chunk: Buffer) => {
-      chunks.push(chunk);
-      total += chunk.length;
+    req.on('data', (piece: Buffer) => {
+      chunks.push(piece);
+      total += piece.length;
       if (total > 64 * 1024 * 1024) {
         reject(new Error('request body too large'));
         req.destroy();
@@ -96,27 +104,28 @@ interface ParsedUrl {
   query: URLSearchParams;
 }
 
-function parseUrl(req: IncomingMessage): ParsedUrl {
-  let pathname = '/';
-  let query = new URLSearchParams();
+/** Shared empty query params for the common no-query-string case. */
+const EMPTY_PARAMS = new URLSearchParams();
+
+function decodeSegment(segment: string): string {
+  if (!segment.includes('%')) return segment;
   try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    pathname = url.pathname;
-    query = url.searchParams;
+    return decodeURIComponent(segment);
   } catch {
-    pathname = '/';
+    return segment;
   }
-  const segments = pathname
+}
+
+function parseUrl(req: IncomingMessage): ParsedUrl {
+  const raw = req.url ?? '/';
+  const q = raw.indexOf('?');
+  const rawPath = q < 0 ? raw : raw.slice(0, q);
+  const query = q < 0 ? EMPTY_PARAMS : new URLSearchParams(raw.slice(q + 1));
+  const segments = rawPath
     .split('/')
     .filter((segment) => segment !== '')
-    .map((segment) => {
-      try {
-        return decodeURIComponent(segment);
-      } catch {
-        return segment;
-      }
-    });
-  return { pathname, segments, query };
+    .map(decodeSegment);
+  return { pathname: rawPath, segments, query };
 }
 
 /** Parse a JSON request body; returns null and answers 400 when it is malformed. */
@@ -574,7 +583,8 @@ function commitJson(store: Store, sha: string): Record<string, unknown> {
   const object = store.getObject(sha);
   let message = '';
   if (object !== undefined && object.type === 'commit') {
-    message = parseCommit(object.data).message;
+    // parseCommit returns the raw body, including the trailing newline makeCommit adds.
+    message = parseCommit(object.data).message.replace(/\n+$/, '');
   }
   return {
     sha,

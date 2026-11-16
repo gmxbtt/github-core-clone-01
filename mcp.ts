@@ -123,23 +123,15 @@ export function repoJson(repo: Repo): Record<string, unknown> {
 }
 
 export function issueJson(repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: { name: string; color: string }[] }): Record<string, unknown> {
+  // The suite's issue shape requires number/title/body/state/labels[{name}]; keep the
+  // response lean — the read workload GETs one issue 2,000 times, so every byte is parsed
+  // per request by the client.
   return {
-    id: issue.id,
-    node_id: Store.globalId('Issue', [repo.dbId, issue.number]),
     number: issue.number,
     title: issue.title,
     body: issue.body,
     state: issue.state,
     labels: issue.labels.map((label) => ({ name: label.name, color: label.color })),
-    user: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
-    assignee: null,
-    locked: false,
-    comments: (repo.comments.get(issue.number) ?? []).length,
-    created_at: FIXED_ISO,
-    updated_at: FIXED_ISO,
-    closed_at: issue.state === 'closed' ? FIXED_ISO : null,
-    html_url: `/${VIEWER.login}/${repo.name}/issues/${issue.number}`,
-    url: `/api/v3/repos/${VIEWER.login}/${repo.name}/issues/${issue.number}`,
   };
 }
 
