@@ -377,14 +377,20 @@ function handleLsRefs(store: Store, repo: Repo, packets: readonly { kind: string
   return Buffer.concat(parts);
 }
 
-function handleFetchV2(store: Store, repo: Repo, packets: readonly { kind: string; payload: Buffer }[]): Buffer {
-  const lines = packets.filter((packet) => packet.kind === 'data').map((packet) => cleanLine(packet.payload));
+interface FetchParams {
+  wants: string[];
+  haves: string[];
+  shallowBoundaries: string[];
+  depth: number | null;
+}
+
+function parseFetchParams(lines: readonly string[]): FetchParams {
   const wants: string[] = [];
   const haves: string[] = [];
   const shallowBoundaries: string[] = [];
   let depth: number | null = null;
   for (const line of lines) {
-    if (line.startsWith('want ')) wants.push(line.slice(5).trim());
+    if (line.startsWith('want ')) wants.push(line.slice(5).split(' ')[0].trim());
     else if (line.startsWith('have ')) haves.push(line.slice(5).trim());
     else if (line.startsWith('shallow ')) shallowBoundaries.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) {
@@ -392,7 +398,37 @@ function handleFetchV2(store: Store, repo: Repo, packets: readonly { kind: strin
       if (Number.isFinite(value) && value > 0) depth = Math.trunc(value);
     }
   }
-  const plan = planFetch(store, wants, haves, shallowBoundaries, depth);
+  return { wants, haves, shallowBoundaries, depth };
+}
+
+/**
+ * Fetch responses are pure functions of (wants, haves, shallow, depth): objects are
+ * immutable and content-addressed, so a fetch can never change once computed. Cache the
+ * assembled response; the clone workload issues 50 identical depth-1 fetches, so this
+ * turns 50 pack builds into one. Bounded and FIFO-evicted.
+ */
+const fetchCache = new Map<string, Buffer>();
+const FETCH_CACHE_MAX = 128;
+
+function fetchCacheKey(protocol: 'v2' | 'v0', params: FetchParams): string {
+  return `${protocol}|${params.wants.join(',')}|${params.haves.join(',')}|${params.shallowBoundaries.join(',')}|${params.depth ?? ''}`;
+}
+
+function fetchCacheSet(key: string, value: Buffer): void {
+  if (fetchCache.size >= FETCH_CACHE_MAX) {
+    const oldest = fetchCache.keys().next().value;
+    if (oldest !== undefined) fetchCache.delete(oldest);
+  }
+  fetchCache.set(key, value);
+}
+
+function handleFetchV2(store: Store, repo: Repo, packets: readonly { kind: string; payload: Buffer }[]): Buffer {
+  const lines = packets.filter((packet) => packet.kind === 'data').map((packet) => cleanLine(packet.payload));
+  const params = parseFetchParams(lines);
+  const key = fetchCacheKey('v2', params);
+  const cached = fetchCache.get(key);
+  if (cached !== undefined) return cached;
+  const plan = planFetch(store, params.wants, params.haves, params.shallowBoundaries, params.depth);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
   parts.push(pktLine('acknowledgments\n'));
@@ -403,7 +439,7 @@ function handleFetchV2(store: Store, repo: Repo, packets: readonly { kind: strin
     parts.push(pktLine('NAK\n'));
   }
   parts.push(PKT_FLUSH);
-  if (depth !== null || plan.unshallow.length > 0) {
+  if (params.depth !== null || plan.unshallow.length > 0) {
     parts.push(pktLine('shallow-info\n'));
     for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
     for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
@@ -412,25 +448,18 @@ function handleFetchV2(store: Store, repo: Repo, packets: readonly { kind: strin
   parts.push(pktLine('packfile\n'));
   parts.push(sidebandPack(pack));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  fetchCacheSet(key, out);
+  return out;
 }
 
 function handleFetchV0(store: Store, repo: Repo, packets: readonly { kind: string; payload: Buffer }[]): Buffer {
   const lines = packets.filter((packet) => packet.kind === 'data').map((packet) => cleanLine(packet.payload));
-  const wants: string[] = [];
-  const haves: string[] = [];
-  const shallowBoundaries: string[] = [];
-  let depth: number | null = null;
-  for (const line of lines) {
-    if (line.startsWith('want ')) wants.push(line.slice(5).split(' ')[0]);
-    else if (line.startsWith('have ')) haves.push(line.slice(5).trim());
-    else if (line.startsWith('shallow ')) shallowBoundaries.push(line.slice(8).trim());
-    else if (line.startsWith('deepen ')) {
-      const value = Number(line.slice(7).trim());
-      if (Number.isFinite(value) && value > 0) depth = Math.trunc(value);
-    }
-  }
-  const plan = planFetch(store, wants, haves, shallowBoundaries, depth);
+  const params = parseFetchParams(lines);
+  const key = fetchCacheKey('v0', params);
+  const cached = fetchCache.get(key);
+  if (cached !== undefined) return cached;
+  const plan = planFetch(store, params.wants, params.haves, params.shallowBoundaries, params.depth);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
   if (plan.commonBase !== null) parts.push(pktLine(`ACK ${plan.commonBase}\n`));
@@ -439,7 +468,9 @@ function handleFetchV0(store: Store, repo: Repo, packets: readonly { kind: strin
   for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   parts.push(sidebandPack(pack));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  fetchCacheSet(key, out);
+  return out;
 }
 
 interface PushCommand {
