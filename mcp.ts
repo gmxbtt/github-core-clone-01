@@ -125,8 +125,9 @@ export function repoJson(repo: Repo): Record<string, unknown> {
 export function issueJson(repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: { name: string; color: string }[] }): Record<string, unknown> {
   // The suite's issue shape requires number/title/body/state/labels[{name}]; keep the
   // response lean — the read workload GETs one issue 2,000 times, so every byte is parsed
-  // per request by the client.
+  // per request by the client. `id` stays: mcp.rest-parity requires a stable REST id.
   return {
+    id: issue.id,
     number: issue.number,
     title: issue.title,
     body: issue.body,
