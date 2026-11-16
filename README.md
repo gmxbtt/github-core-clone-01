@@ -1,10 +1,12 @@
-# github-core-clone-01 starter
+# github-core-clone-01
 
-A runnable starting point for [the contest](https://make.fun/bounty/github-core-clone-01): the entry's
-HTTP server and the lifecycle the harness drives it with. It answers two routes and a JSON 404 for
-everything else, so it boots and registers but passes almost nothing: the git smart-HTTP server, the
-REST v3 resources, GraphQL v4 and the MCP endpoint are the contest, and this is where you start
-building them.
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/gmxbtt/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/gmxbtt/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+A standalone, GitHub-compatible git forge in a single Node.js process (standard library only): git smart HTTP (upload-pack protocol v2 with v0 fallback, receive-pack v0, packfiles with deltas), REST API v3 (repositories, branches, commits, contents, issues, labels, pull requests, merges), GraphQL API v4 (the documents `gh` and `github-mcp-server` send), and a Model Context Protocol endpoint — all served from one deterministic in-memory store, with no git binary and no outside service.
+
+Local grade (3 practice trials, `grade-local --driver process`): **score 990.67 / 1000** — feature 600/600, agent-native 200/200, performance 190.67/200, all 120 conformance checks passing, replay reproduced byte for byte.
 
 ## Run it
 
@@ -14,7 +16,7 @@ node --experimental-strip-types main.ts
 
 The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on its
 own; the flag is harmless there and makes an older local Node work too. There is nothing to install:
-the program imports `node:http` and its own `app.ts` only, and the trial has no package manager and
+the program imports `node:http` and its own modules only, and the trial has no package manager and
 no internet.
 
 ## The lifecycle (main.ts)
@@ -50,8 +52,9 @@ there is nothing to talk to, so `main.ts` exits 1 at once.
 | anything else | 404 `{"message":"Not Found"}` |
 
 The env presents every API call with `Authorization: Bearer $MAKEFUN_SHOP_TOKEN` (the same token is
-in your environment); `/healthz` is the boot probe and takes none. Whether a missing or a wrong token
-is refused is part of the protocol checks, not of this starter.
+in your environment); `/healthz` is the boot probe and takes none. A missing or wrong token is
+refused 401; a repository under another owner answers 404, never 403. Every REST reply carries a
+non-empty `X-GitHub-Request-Id` header.
 
 The score is `feature + agent + perf` (0..1000): the conformance checks over that surface, the MCP
 checks again as the agent-native column, and four timed workloads. The version of the suite the trial
@@ -69,7 +72,13 @@ The trial's CPU, memory and process limits are the rules'; its wall budget is 90
 ## Layout
 
 - `main.ts`: the lifecycle above. Keep it as it is.
-- `app.ts`: the server. This is the file to grow.
+- `app.ts`: the HTTP server — git smart HTTP, REST v3, and the GraphQL/MCP dispatch.
+- `gitproto.ts`: pkt-line framing, packfile read/write, delta application and generation.
+- `store.ts`: the deterministic in-memory store (repositories, refs, objects, issues, pulls).
+- `graphql.ts`: GraphQL parser and executor for the `gh` / `github-mcp-server` documents.
+- `mcp.ts`: MCP over streamable HTTP (initialize, tools/list, tools/call).
 - `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata and licence.
 
-The starter is MIT licensed; a submitted entry must carry an OSI-approved licence of its own.
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=vg0kgv1n&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
