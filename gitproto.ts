@@ -29,9 +29,24 @@ export function sha1Hex(data: Buffer | Uint8Array): string {
 export function hashObject(type: ObjType, data: Uint8Array): string {
   const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const hash = createHash('sha1');
-  hash.update(Buffer.from(`${type} ${body.length}\0`, 'utf8'));
+  // Feed the header as a string: the exact same bytes as Buffer.from(header),
+  // without allocating a throwaway header Buffer per object.
+  hash.update(`${type} ${body.length}\0`, 'utf8');
   hash.update(body);
   return hash.digest('hex');
+}
+
+/** True when `value` is exactly four hexadecimal characters (a pkt-line length). */
+export function isHex4(value: string): boolean {
+  if (value.length !== 4) return false;
+  for (let i = 0; i < 4; i += 1) {
+    const code = value.charCodeAt(i);
+    const digit = code >= 48 && code <= 57;
+    const lower = code >= 97 && code <= 102;
+    const upper = code >= 65 && code <= 70;
+    if (!digit && !lower && !upper) return false;
+  }
+  return true;
 }
 
 export function isObjectId(value: string): boolean {
@@ -43,15 +58,23 @@ export function isObjectId(value: string): boolean {
 // ---------------------------------------------------------------------------
 
 export function pktLine(payload: string | Uint8Array): Buffer {
-  const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : Buffer.from(payload);
-  if (data.length > PKT_LINE_MAX - 4) throw new Error(`pkt-line payload is ${data.length} bytes, over the maximum`);
-  const header = Buffer.allocUnsafe(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+  // One allocation for header + payload: the old shape copied a Buffer payload once
+  // for Buffer.from and once more inside Buffer.concat.
+  const dataLength = typeof payload === 'string' ? Buffer.byteLength(payload, 'utf8') : payload.length;
+  if (dataLength > PKT_LINE_MAX - 4) throw new Error(`pkt-line payload is ${dataLength} bytes, over the maximum`);
+  const out = Buffer.allocUnsafe(dataLength + 4);
+  out.write((dataLength + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  if (typeof payload === 'string') out.write(payload, 4, 'utf8');
+  else if (Buffer.isBuffer(payload)) payload.copy(out, 4);
+  else Buffer.from(payload).copy(out, 4);
+  return out;
 }
 
 export const PKT_FLUSH = Buffer.from('0000', 'ascii');
 export const PKT_DELIM = Buffer.from('0001', 'ascii');
+
+/** Shared empty payload for control packets; decodePktLines never mutates it. */
+const EMPTY_PAYLOAD = Buffer.alloc(0);
 
 export function encodePktLines(items: ReadonlyArray<string | Uint8Array | 'flush' | 'delim'>): Buffer {
   const parts: Buffer[] = [];
@@ -77,16 +100,16 @@ export function decodePktLines(bytes: Buffer): Pkt[] {
   while (offset < bytes.length) {
     if (offset + 4 > bytes.length) throw new Error('truncated pkt-line header');
     const header = bytes.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error(`invalid pkt-line length ${JSON.stringify(header)}`);
+    if (!isHex4(header)) throw new Error(`invalid pkt-line length ${JSON.stringify(header)}`);
     const length = Number.parseInt(header, 16);
     if (length === 0) {
-      out.push({ kind: 'flush', payload: Buffer.alloc(0) });
+      out.push({ kind: 'flush', payload: EMPTY_PAYLOAD });
       offset += 4;
     } else if (length === 1) {
-      out.push({ kind: 'delim', payload: Buffer.alloc(0) });
+      out.push({ kind: 'delim', payload: EMPTY_PAYLOAD });
       offset += 4;
     } else if (length === 2) {
-      out.push({ kind: 'response-end', payload: Buffer.alloc(0) });
+      out.push({ kind: 'response-end', payload: EMPTY_PAYLOAD });
       offset += 4;
     } else if (length === 3 || length > PKT_LINE_MAX) {
       throw new Error(`invalid pkt-line length ${length}`);
@@ -278,6 +301,7 @@ export function readPack(
   const raw: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
   let offset = 12;
+  let hasDelta = false;
   for (let index = 0; index < declaredCount; index += 1) {
     const entryOffset = offset;
     const header = readVarintSize(buffer, offset);
@@ -285,11 +309,13 @@ export function readPack(
     const typeCode = (header.first >> 4) & 0x07;
     const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
     if (typeCode === 6) {
+      hasDelta = true;
       const base = readOfsDeltaBase(buffer, offset);
       offset = base.next;
       if (base.baseOffset <= 0 || base.baseOffset > entryOffset) throw new Error(`ofs-delta at ${entryOffset} names an invalid base offset ${base.baseOffset}`);
       entry.baseOffset = entryOffset - base.baseOffset;
     } else if (typeCode === 7) {
+      hasDelta = true;
       if (offset + 20 > trailerStart) throw new Error('ref-delta base id is truncated');
       entry.baseOid = buffer.subarray(offset, offset + 20).toString('hex');
       offset += 20;
@@ -308,6 +334,18 @@ export function readPack(
   if (offset !== trailerStart) throw new Error(`pack has ${trailerStart - offset} stray bytes before its trailer`);
 
   const objects = new Map<string, GitObject>();
+  if (!hasDelta) {
+    // Plain packs (the push workload's three-object packs, and every pack
+    // writePack builds) carry no deltas: hash each entry straight into the
+    // result instead of running the delta resolver's maps and recursion.
+    // Same validation already ran above; same first-wins rule for duplicate ids.
+    for (const entry of raw) {
+      const type = CODE_TYPE[entry.typeCode];
+      const oid = hashObject(type, entry.data);
+      if (!objects.has(oid)) objects.set(oid, { type, data: entry.data });
+    }
+    return objects;
+  }
   const resolvedByOid = new Map<string, RawEntry>();
   const resolving = new Set<number>();
 

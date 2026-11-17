@@ -6,6 +6,7 @@ import { GraphQLExecutor } from './graphql.ts';
 import {
   decodePktLines,
   encodePktLines,
+  isHex4,
   isObjectId,
   parseCommit,
   pktLine,
@@ -118,6 +119,15 @@ interface ParsedUrl {
 /** Shared empty query params for the common no-query-string case. */
 const EMPTY_PARAMS = new URLSearchParams();
 
+/**
+ * The only query strings the git advertisement requests ever carry, parsed once.
+ * parseUrl returns these shared instances for an exact match (query params are
+ * only ever read with .get here, never mutated), skipping URLSearchParams's
+ * per-request parse on every info/refs exchange.
+ */
+const QUERY_SERVICE_RECEIVE_PACK = new URLSearchParams('service=git-receive-pack');
+const QUERY_SERVICE_UPLOAD_PACK = new URLSearchParams('service=git-upload-pack');
+
 function decodeSegment(segment: string): string {
   if (!segment.includes('%')) return segment;
   try {
@@ -131,7 +141,15 @@ function parseUrl(req: IncomingMessage): ParsedUrl {
   const raw = req.url ?? '/';
   const q = raw.indexOf('?');
   const rawPath = q < 0 ? raw : raw.slice(0, q);
-  const query = q < 0 ? EMPTY_PARAMS : new URLSearchParams(raw.slice(q + 1));
+  let query: URLSearchParams;
+  if (q < 0) {
+    query = EMPTY_PARAMS;
+  } else {
+    const rawQuery = raw.slice(q + 1);
+    if (rawQuery === 'service=git-receive-pack') query = QUERY_SERVICE_RECEIVE_PACK;
+    else if (rawQuery === 'service=git-upload-pack') query = QUERY_SERVICE_UPLOAD_PACK;
+    else query = new URLSearchParams(rawQuery);
+  }
   if (!rawPath.includes('%')) {
     // Fast path: nothing to percent-decode, so decodeSegment is the identity.
     return { pathname: rawPath, segments: rawPath.split('/').filter((segment) => segment !== ''), query };
@@ -507,7 +525,7 @@ function handleReceivePack(store: Store, repo: Repo, body: Buffer): { status: nu
   try {
     while (offset + 4 <= body.length) {
       const header = body.subarray(offset, offset + 4).toString('ascii');
-      if (!/^[0-9a-fA-F]{4}$/.test(header)) {
+      if (!isHex4(header)) {
         malformed = true;
         break;
       }
