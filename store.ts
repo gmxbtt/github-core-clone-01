@@ -11,6 +11,7 @@ import {
   parseTag,
   parseTree,
   ZERO_OID,
+  type CommitView,
   type GitObject,
   type ObjType,
   type TreeEntry,
@@ -122,6 +123,49 @@ export class Store {
     return this.objects.get(oid);
   }
 
+  /**
+   * Lazily parsed views of commit/tree objects, keyed by oid. Objects are never
+   * mutated once stored (putObject and receive-pack both only insert oids that are
+   * not already present), so a parsed view stays valid for the store's lifetime.
+   * This turns repeated parses of the same commit/tree — ancestry walks, tree
+   * flattening, diffs — into one parse per oid.
+   */
+  private readonly parsedCommits = new Map<string, CommitView>();
+  private readonly parsedTrees = new Map<string, TreeEntry[]>();
+
+  /** The parsed view of a commit, or null when the oid is missing, not a commit, or malformed. */
+  commitView(oid: string): CommitView | null {
+    const cached = this.parsedCommits.get(oid);
+    if (cached !== undefined) return cached;
+    const object = this.objects.get(oid);
+    if (object === undefined || object.type !== 'commit') return null;
+    try {
+      const view = parseCommit(object.data);
+      this.parsedCommits.set(oid, view);
+      return view;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The parsed entries of a tree, or null when the oid is missing, not a tree, or
+   * malformed. Callers must not mutate the returned array (it is the cached copy).
+   */
+  treeEntries(oid: string): TreeEntry[] | null {
+    const cached = this.parsedTrees.get(oid);
+    if (cached !== undefined) return cached;
+    const object = this.objects.get(oid);
+    if (object === undefined || object.type !== 'tree') return null;
+    try {
+      const entries = parseTree(object.data);
+      this.parsedTrees.set(oid, entries);
+      return entries;
+    } catch {
+      return null;
+    }
+  }
+
   putBlob(data: Buffer): string {
     return this.putObject('blob', data);
   }
@@ -154,24 +198,12 @@ export class Store {
 
   /** The tree oid of a commit, or null. */
   treeOfCommit(commitOid: string): string | null {
-    const object = this.objects.get(commitOid);
-    if (!object || object.type !== 'commit') return null;
-    try {
-      return parseCommit(object.data).tree;
-    } catch {
-      return null;
-    }
+    return this.commitView(commitOid)?.tree ?? null;
   }
 
   /** The parents of a commit, or []. */
   parentsOf(commitOid: string): string[] {
-    const object = this.objects.get(commitOid);
-    if (!object || object.type !== 'commit') return [];
-    try {
-      return parseCommit(object.data).parents;
-    } catch {
-      return [];
-    }
+    return this.commitView(commitOid)?.parents ?? [];
   }
 
   /** True when `ancestor` is `descendant` or reachable from it through parents. */
@@ -203,12 +235,10 @@ export class Store {
       if (!object) continue;
       seen.add(oid);
       if (object.type === 'commit') {
-        try {
-          const commit = parseCommit(object.data);
+        const commit = this.commitView(oid);
+        if (commit !== null) {
           queue.push(commit.tree);
           for (const parent of commit.parents) queue.push(parent);
-        } catch {
-          // ignore a malformed commit
         }
       } else if (object.type === 'tag') {
         try {
@@ -217,12 +247,11 @@ export class Store {
           // ignore
         }
       } else if (object.type === 'tree') {
-        try {
-          for (const entry of parseTree(object.data)) {
+        const entries = this.treeEntries(oid);
+        if (entries !== null) {
+          for (const entry of entries) {
             if (entry.mode !== '160000') queue.push(entry.oid);
           }
-        } catch {
-          // ignore
         }
       }
     }
@@ -256,16 +285,11 @@ export class Store {
     const segments = path.split('/').filter((segment) => segment !== '');
     if (segments.length === 0) throw new Error('empty path');
     const build = (treeOid: string | null, depth: number): string => {
+      // Copy the cached entries into a fresh array: the build below mutates it.
       const entries: TreeEntry[] = [];
       if (treeOid !== null) {
-        const object = this.objects.get(treeOid);
-        if (object && object.type === 'tree') {
-          try {
-            for (const entry of parseTree(object.data)) entries.push(entry);
-          } catch {
-            // treat a malformed tree as empty
-          }
-        }
+        const cached = this.treeEntries(treeOid);
+        if (cached !== null) for (const entry of cached) entries.push(entry);
       }
       const name = segments[depth];
       const last = depth === segments.length - 1;
@@ -282,8 +306,8 @@ export class Store {
         const childTree = at >= 0 && entries[at].mode === '40000' ? entries[at].oid : null;
         const newChild = build(childTree, depth + 1);
         // Drop an emptied directory.
-        const childObject = this.objects.get(newChild);
-        const childEmpty = childObject !== undefined && childObject.type === 'tree' && parseTree(childObject.data).length === 0;
+        const childEntries = this.treeEntries(newChild);
+        const childEmpty = childEntries !== null && childEntries.length === 0;
         if (childEmpty) {
           if (at >= 0) entries.splice(at, 1);
         } else if (at >= 0) {
@@ -303,14 +327,9 @@ export class Store {
     const segments = path.split('/').filter((segment) => segment !== '');
     let current = treeOid;
     for (let depth = 0; depth < segments.length; depth += 1) {
-      const object = this.objects.get(current);
-      if (!object || object.type !== 'tree') return null;
-      let found: TreeEntry | undefined;
-      try {
-        found = parseTree(object.data).find((entry) => entry.name === segments[depth]);
-      } catch {
-        return null;
-      }
+      const entries = this.treeEntries(current);
+      if (entries === null) return null;
+      const found = entries.find((entry) => entry.name === segments[depth]);
       if (!found) return null;
       if (depth === segments.length - 1) return { oid: found.oid, mode: found.mode };
       if (found.mode !== '40000') return null;
@@ -326,25 +345,15 @@ export class Store {
     if (path !== '') {
       const segments = path.split('/').filter((segment) => segment !== '');
       for (const segment of segments) {
-        const object = this.objects.get(current);
-        if (!object || object.type !== 'tree') return null;
-        let found: TreeEntry | undefined;
-        try {
-          found = parseTree(object.data).find((entry) => entry.name === segment);
-        } catch {
-          return null;
-        }
+        const entries = this.treeEntries(current);
+        if (entries === null) return null;
+        const found = entries.find((entry) => entry.name === segment);
         if (!found || found.mode !== '40000') return null;
         current = found.oid;
       }
     }
-    const object = this.objects.get(current);
-    if (!object || object.type !== 'tree') return null;
-    try {
-      return parseTree(object.data);
-    } catch {
-      return null;
-    }
+    // The cached array: callers only read it (see app.ts contents handlers).
+    return this.treeEntries(current);
   }
 
   /** Flatten a tree into path -> {oid, mode} for every blob (and subtree) entry. */
@@ -352,14 +361,8 @@ export class Store {
     const out = new Map<string, { oid: string; mode: string }>();
     if (treeOid === null) return out;
     const walk = (oid: string, base: string): void => {
-      const object = this.objects.get(oid);
-      if (!object || object.type !== 'tree') return;
-      let entries: TreeEntry[];
-      try {
-        entries = parseTree(object.data);
-      } catch {
-        return;
-      }
+      const entries = this.treeEntries(oid);
+      if (entries === null) return;
       for (const entry of entries) {
         const path = base === '' ? entry.name : `${base}/${entry.name}`;
         out.set(path, { oid: entry.oid, mode: entry.mode });

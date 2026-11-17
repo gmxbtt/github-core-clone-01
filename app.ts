@@ -16,7 +16,7 @@ import {
   PKT_FLUSH,
   type GitObject,
 } from './gitproto.ts';
-import { handleMcp, issueJson, prJson, repoJson } from './mcp.ts';
+import { handleMcp, invalidateIssueJson, issueJson, issueJsonText, issueJsonTextLength, prJson, repoJson } from './mcp.ts';
 import {
   FIXED_ISO,
   Store,
@@ -48,6 +48,17 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': Buffer.byteLength(text),
+    'x-github-request-id': nextRequestId(),
+    ...headers,
+  });
+  res.end(text);
+}
+
+/** Write an already-serialized JSON body (with trailing newline) without re-stringifying or re-measuring it. */
+function sendJsonText(res: ServerResponse, status: number, text: string, length: number, headers: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': length,
     'x-github-request-id': nextRequestId(),
     ...headers,
   });
@@ -121,6 +132,10 @@ function parseUrl(req: IncomingMessage): ParsedUrl {
   const q = raw.indexOf('?');
   const rawPath = q < 0 ? raw : raw.slice(0, q);
   const query = q < 0 ? EMPTY_PARAMS : new URLSearchParams(raw.slice(q + 1));
+  if (!rawPath.includes('%')) {
+    // Fast path: nothing to percent-decode, so decodeSegment is the identity.
+    return { pathname: rawPath, segments: rawPath.split('/').filter((segment) => segment !== ''), query };
+  }
   const segments = rawPath
     .split('/')
     .filter((segment) => segment !== '')
@@ -210,16 +225,19 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
+/** The protocol-v2 advertisement is identical on every request: build it once. */
+const V2_ADVERTISEMENT: Buffer = encodePktLines([
+  'version 2\n',
+  `agent=${AGENT}\n`,
+  'ls-refs=unborn\n',
+  'fetch=shallow wait-for-done filter\n',
+  'server-option\n',
+  'object-format=sha1\n',
+  'flush',
+]);
+
 function v2Advertisement(): Buffer {
-  return encodePktLines([
-    'version 2\n',
-    `agent=${AGENT}\n`,
-    'ls-refs=unborn\n',
-    'fetch=shallow wait-for-done filter\n',
-    'server-option\n',
-    'object-format=sha1\n',
-    'flush',
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 // The store is module state so the git helpers below can read it without threading it
@@ -613,9 +631,14 @@ function viewerJson(): Record<string, unknown> {
 function commitJson(store: Store, sha: string): Record<string, unknown> {
   const object = store.getObject(sha);
   let message = '';
+  let treeSha = ZERO_OID;
   if (object !== undefined && object.type === 'commit') {
     // parseCommit returns the raw body, including the trailing newline makeCommit adds.
-    message = parseCommit(object.data).message.replace(/\n+$/, '');
+    // commitView returns null only for a malformed commit; re-parse then, as before,
+    // so a malformed commit still throws instead of silently reporting an empty tree.
+    const view = store.commitView(sha) ?? parseCommit(object.data);
+    message = view.message.replace(/\n+$/, '');
+    treeSha = view.tree;
   }
   return {
     sha,
@@ -624,7 +647,7 @@ function commitJson(store: Store, sha: string): Record<string, unknown> {
       message,
       author: { name: VIEWER.name, email: VIEWER.email, date: FIXED_ISO },
       committer: { name: VIEWER.name, email: VIEWER.email, date: FIXED_ISO },
-      tree: { sha: object !== undefined && object.type === 'commit' ? parseCommit(object.data).tree : ZERO_OID },
+      tree: { sha: treeSha },
     },
     author: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
     committer: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
@@ -1036,7 +1059,7 @@ async function handleRest(
             labels.push(found);
           }
           const issue = store.createIssue(repo, title, bodyText, labels);
-          return sendJson(res, 201, issueJson(repo, issue));
+          return sendJsonText(res, 201, issueJsonText(repo, issue), issueJsonTextLength(repo, issue));
         }
         return sendError(res, 404, 'Not Found');
       }
@@ -1046,7 +1069,7 @@ async function handleRest(
         if (method === 'GET') {
           const issue = repo.issues.get(issueNumber);
           if (issue === undefined) return sendError(res, 404, 'Not Found');
-          return sendJson(res, 200, issueJson(repo, issue));
+          return sendJsonText(res, 200, issueJsonText(repo, issue), issueJsonTextLength(repo, issue));
         }
         if (method === 'PATCH') {
           const issue = repo.issues.get(issueNumber);
@@ -1056,7 +1079,8 @@ async function handleRest(
           if (typeof input.state === 'string' && (input.state === 'open' || input.state === 'closed')) issue.state = input.state;
           if (typeof input.title === 'string') issue.title = input.title;
           if (typeof input.body === 'string') issue.body = input.body;
-          return sendJson(res, 200, issueJson(repo, issue));
+          invalidateIssueJson(issue);
+          return sendJsonText(res, 200, issueJsonText(repo, issue), issueJsonTextLength(repo, issue));
         }
         return sendError(res, 404, 'Not Found');
       }

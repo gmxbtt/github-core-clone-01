@@ -122,7 +122,53 @@ export function repoJson(repo: Repo): Record<string, unknown> {
   };
 }
 
-export function issueJson(repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: { name: string; color: string }[] }): Record<string, unknown> {
+/** The shape issueJson accepts. */
+export type IssueJsonInput = { id: number; number: number; title: string; body: string; state: string; labels: { name: string; color: string }[] };
+
+/** One cached serialization of an issue's REST JSON (with trailing newline, as sent). */
+interface IssueJsonCacheEntry {
+  text: string;
+  length: number;
+  /** The mutable fields the text was built from; a mismatch means the issue changed. */
+  title: string;
+  body: string;
+  state: string;
+}
+
+/**
+ * Issue serializations, cached per issue object. Labels never change after create,
+ * and title/body/state are re-checked on every hit, so a mutation through any path
+ * (REST PATCH, GraphQL closeIssue) can never serve a stale body.
+ */
+const issueJsonCache = new WeakMap<object, IssueJsonCacheEntry>();
+
+function issueJsonCached(repo: Repo, issue: IssueJsonInput): IssueJsonCacheEntry {
+  const cached = issueJsonCache.get(issue);
+  if (cached !== undefined && cached.title === issue.title && cached.body === issue.body && cached.state === issue.state) {
+    return cached;
+  }
+  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  const entry: IssueJsonCacheEntry = { text, length: Buffer.byteLength(text), title: issue.title, body: issue.body, state: issue.state };
+  issueJsonCache.set(issue, entry);
+  return entry;
+}
+
+/** The issue's REST JSON text (with trailing newline), serialized once per version. */
+export function issueJsonText(repo: Repo, issue: IssueJsonInput): string {
+  return issueJsonCached(repo, issue).text;
+}
+
+/** Byte length of issueJsonText(repo, issue), without re-measuring. */
+export function issueJsonTextLength(repo: Repo, issue: IssueJsonInput): number {
+  return issueJsonCached(repo, issue).length;
+}
+
+/** Drop the cached serialization of an issue (its title/body/state changed). */
+export function invalidateIssueJson(issue: IssueJsonInput): void {
+  issueJsonCache.delete(issue);
+}
+
+export function issueJson(repo: Repo, issue: IssueJsonInput): Record<string, unknown> {
   // The suite's issue shape requires number/title/body/state/labels[{name}]; keep the
   // response lean — the read workload GETs one issue 2,000 times, so every byte is parsed
   // per request by the client. `id` stays: mcp.rest-parity requires a stable REST id.
